@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Smart Tab Manager</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="header">
+    <h1>Smart Tab Manager</h1>
+    <div class="actions">
+      <button id="analyze-btn">Analyze Tabs</button>
+      <button id="close-inactive-btn">Close Inactive</button>
+    </div>
+  </div>
+  
+  <div class="search-container">
+    <input type="text" id="search-input" placeholder="Search tabs...">
+  </div>
+  
+  <div class="stats-container">
+    <div class="stat-item">
+      <span class="stat-value" id="total-tabs">0</span>
+      <span class="stat-label">Total Tabs</span>
+    </div>
+    <div class="stat-item">
+      <span class="stat-value" id="inactive-tabs">0</span>
+      <span class="stat-label">Inactive</span>
+    </div>
+    <div class="stat-item">
+      <span class="stat-value" id="groups-count">0</span>
+      <span class="stat-label">Groups</span>
+    </div>
+  </div>
+  
+  <div class="tab-groups" id="tab-groups-container">
+    <!-- Tab groups will be inserted here dynamically -->
+  </div>
+  
+  <div class="footer">
+    <p>Smart Tab Manager v0.1.0</p>
+  </div>
+  
+  <script src="../lib/browser-polyfill.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
