@@ -7,21 +7,28 @@
     "tabs",
     "storage",
     "activeTab",
-    "scripting"
+    "scripting",
+    "webNavigation"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "<all_urls>",
+    "http://*/*",
+    "https://*/*",
+    "file://*/*"
   ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["<all_urls>"],
+      "matches": ["<all_urls>", "http://*/*", "https://*/*"],
       "js": ["content/content.js"],
       "run_at": "document_idle"
     }
   ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; img-src 'self' https: data: chrome://favicon;"
+  },
   "action": {
     "default_popup": "popup/popup.html",
     "default_icon": {

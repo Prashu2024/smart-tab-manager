@@ -2,6 +2,40 @@
 let tabData = {};
 let categories = new Set();
 
+// Create a favicon cache
+const faviconCache = new Map();
+
+// Function to get favicon URL with caching
+function getFaviconUrl(domain) {
+  if (faviconCache.has(domain)) {
+    return faviconCache.get(domain);
+  }
+  
+  // Try to get the favicon from google's favicon service as it's more reliable
+  const faviconUrl = `https://www.google.com/s2/favicons?domain=${domain}&sz=32`;
+  faviconCache.set(domain, faviconUrl);
+  return faviconUrl;
+}
+
+// Intersection Observer for lazy loading favicons
+const faviconObserver = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      const container = entry.target;
+      const domain = container.dataset.domain;
+      if (domain) {
+        const img = container.querySelector('img');
+        if (img && !img.src) {
+          img.src = getFaviconUrl(domain);
+        }
+      }
+      faviconObserver.unobserve(container);
+    }
+  });
+}, {
+  rootMargin: '50px' // Start loading when favicon is 50px away from viewport
+});
+
 // Function to initialize the popup
 async function initPopup() {
   // Retrieve tab data from background script
@@ -42,18 +76,45 @@ async function initPopup() {
 
 // Function to analyze all tabs
 async function analyzeTabs() {
-  const tabs = await chrome.tabs.query({});
-  
-  document.getElementById('analyze-btn').textContent = "Analyzing...";
-  document.getElementById('analyze-btn').disabled = true;
-  
-  // This would normally be handled in the background script
-  // But for the prototype, we'll simulate it
-  setTimeout(() => {
-    document.getElementById('analyze-btn').textContent = "Analyze Tabs";
-    document.getElementById('analyze-btn').disabled = false;
-    renderTabGroups();
-  }, 1500);
+  try {
+    // Update button state
+    const analyzeBtn = document.getElementById('analyze-btn');
+    analyzeBtn.textContent = "Analyzing...";
+    analyzeBtn.disabled = true;
+
+    // Get all tabs
+    const tabs = await chrome.tabs.query({});
+    
+    // Clear existing tab data
+    tabData = {};
+    
+    // Analyze each tab
+    for (const tab of tabs) {
+      // Send message to background script to analyze this tab
+      chrome.runtime.sendMessage({ 
+        action: "analyzeSingleTab", 
+        tabId: tab.id 
+      });
+    }
+    
+    // Wait for a short time to allow background script to process
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // Get updated tab data
+    chrome.runtime.sendMessage({ action: "getTabData" }, (response) => {
+      if (response && response.tabData) {
+        tabData = response.tabData;
+        renderTabGroups();
+      }
+    });
+  } catch (error) {
+    console.error('Error analyzing tabs:', error);
+  } finally {
+    // Reset button state
+    const analyzeBtn = document.getElementById('analyze-btn');
+    analyzeBtn.textContent = "Analyze Tabs";
+    analyzeBtn.disabled = false;
+  }
 }
 
 // Function to close inactive tabs
@@ -167,20 +228,53 @@ function renderTabGroups() {
       tabElement.className = 'tab-item';
       tabElement.dataset.tabId = tab.id;
       
-      // Get favicon from URL
-      const faviconUrl = `chrome://favicon/${tab.url}`;
+      // Create favicon container with lazy loading
+      const faviconContainer = document.createElement('div');
+      faviconContainer.className = 'favicon-container';
       
-      tabElement.innerHTML = `
-        <img class="tab-favicon" src="${faviconUrl}" alt="">
-        <div class="tab-info">
-          <div class="tab-title">${tab.title}</div>
-          <div class="tab-summary">${tab.summary}</div>
-        </div>
-        <div class="tab-actions">
-          <button class="tab-action-btn tab-goto-btn" title="Go to tab">↗</button>
-          <button class="tab-action-btn tab-close-btn" title="Close tab">✕</button>
-        </div>
+      try {
+        const domain = new URL(tab.url).hostname;
+        if (domain) {
+          faviconContainer.dataset.domain = domain;
+          const faviconImg = document.createElement('img');
+          faviconImg.className = 'tab-favicon';
+          faviconImg.alt = '';
+          // Don't set src yet - will be set by Intersection Observer
+          faviconContainer.appendChild(faviconImg);
+          // Observe the container for lazy loading
+          faviconObserver.observe(faviconContainer);
+        } else {
+          const defaultFavicon = document.createElement('div');
+          defaultFavicon.className = 'default-favicon';
+          faviconContainer.appendChild(defaultFavicon);
+        }
+      } catch (e) {
+        // If URL parsing fails, use default favicon
+        const defaultFavicon = document.createElement('div');
+        defaultFavicon.className = 'default-favicon';
+        faviconContainer.appendChild(defaultFavicon);
+      }
+      
+      // Create tab info container
+      const tabInfo = document.createElement('div');
+      tabInfo.className = 'tab-info';
+      tabInfo.innerHTML = `
+        <div class="tab-title">${tab.title}</div>
+        <div class="tab-summary">${tab.summary}</div>
       `;
+      
+      // Create actions container
+      const tabActions = document.createElement('div');
+      tabActions.className = 'tab-actions';
+      tabActions.innerHTML = `
+        <button class="tab-action-btn tab-goto-btn" title="Go to tab">↗</button>
+        <button class="tab-action-btn tab-close-btn" title="Close tab">✕</button>
+      `;
+      
+      // Append all elements
+      tabElement.appendChild(faviconContainer);
+      tabElement.appendChild(tabInfo);
+      tabElement.appendChild(tabActions);
       
       tabListElement.appendChild(tabElement);
     });
