@@ -69,13 +69,62 @@ async function loadSavedData() {
 async function refreshAllTabData() {
   try {
     console.log('Refreshing all tab data...');
+    
+    // Get all tabs first
     const tabs = await chrome.tabs.query({});
+    console.log(`Found ${tabs.length} tabs to refresh`);
+    
+    if (tabs.length === 0) {
+      console.warn('No tabs found to refresh');
+      return false;
+    }
+    
+    // Create a map of existing tab IDs for faster lookup
+    const existingTabIds = new Set(tabs.map(tab => tab.id));
+    
+    // Remove any tabs from tabData that no longer exist
+    for (const tabId in tabData) {
+      if (!existingTabIds.has(parseInt(tabId))) {
+        delete tabData[tabId];
+      }
+    }
+    
+    // Add any missing tabs to tabData with basic info
+    for (const tab of tabs) {
+      if (!tabData[tab.id]) {
+        tabData[tab.id] = {
+          id: tab.id,
+          url: tab.url,
+          title: tab.title,
+          category: await getCategory(tab.url),
+          summary: tab.title || "No summary available",
+          lastAccessed: new Date().getTime(),
+          content: { title: tab.title, metaDescription: "", bodyText: "" }
+        };
+      }
+    }
+    
+    // Save the current state to storage immediately
+    await chrome.storage.local.set({ tabData });
     
     // Process tabs in batches
     const BATCH_SIZE = 5;
     for (let i = 0; i < tabs.length; i += BATCH_SIZE) {
       const batch = tabs.slice(i, i + BATCH_SIZE);
+      
+      // Send progress update
+      if (i > 0) {
+        sendMessageToPopupIfOpen({
+          action: "tabAnalysisProgress",
+          processed: i,
+          total: tabs.length
+        });
+      }
+      
       await Promise.all(batch.map(tab => analyzeTab(tab)));
+      
+      // Save after each batch
+      await chrome.storage.local.set({ tabData });
       
       // Small delay between batches
       if (i + BATCH_SIZE < tabs.length) {
@@ -96,6 +145,13 @@ async function refreshAllTabData() {
     return true;
   } catch (error) {
     console.error('Error refreshing all tab data:', error);
+    
+    // Try to notify popup of the error
+    sendMessageToPopupIfOpen({
+      action: "tabDataError",
+      error: error.message
+    });
+    
     return false;
   }
 }
@@ -663,21 +719,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   } else if (message.action === "analyzeAllTabs") {
     console.log('Received analyzeAllTabs request');
     
-    // Send an immediate acknowledgment to prevent timeout
+    // Send immediate acknowledgment
     sendResponse({ success: true, status: 'started' });
     
-    // Then do the actual work
-    chrome.tabs.query({}).then(async tabs => {
-      console.log(`Found ${tabs.length} tabs to analyze`);
-      
+    // Process in background
+    (async () => {
       try {
-        // Process tabs in batches to avoid overwhelming the browser
+        const tabs = await chrome.tabs.query({});
+        console.log(`Found ${tabs.length} tabs to analyze`);
+        
+        // Process tabs in batches
         const BATCH_SIZE = 5;
         for (let i = 0; i < tabs.length; i += BATCH_SIZE) {
           const batch = tabs.slice(i, i + BATCH_SIZE);
-          console.log(`Processing batch ${i/BATCH_SIZE + 1} of ${Math.ceil(tabs.length/BATCH_SIZE)}`);
+          
+          // Send progress update
+          sendMessageToPopupIfOpen({
+            action: "tabAnalysisProgress",
+            processed: i,
+            total: tabs.length
+          });
           
           await Promise.all(batch.map(tab => analyzeTab(tab)));
+          
+          // Save after each batch
+          await chrome.storage.local.set({ tabData });
           
           // Small delay between batches
           if (i + BATCH_SIZE < tabs.length) {
@@ -687,30 +753,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         
         // Save the final data
         await chrome.storage.local.set({ tabData });
-        console.log('Tab analysis complete, sending update');
         
-        // Notify popup of completion
+        // Notify popup if open
         sendMessageToPopupIfOpen({
           action: "tabDataUpdated",
           tabData: tabData,
           status: 'complete'
         });
       } catch (error) {
-        console.error('Error during batch processing:', error);
+        console.error('Error in analyzeAllTabs:', error);
         sendMessageToPopupIfOpen({
-          action: "tabDataUpdated",
-          error: error.message,
-          status: 'error'
+          action: "tabDataError",
+          error: error.message
         });
       }
-    }).catch(error => {
-      console.error('Error querying tabs:', error);
-      sendMessageToPopupIfOpen({
-        action: "tabDataUpdated",
-        error: error.message,
-        status: 'error'
-      });
-    });
+    })();
+    
+    // Return true to indicate we'll respond asynchronously
+    return true;
+  } else if (message.action === "refreshAllTabs") {
+    console.log('Received refreshAllTabs request');
+    
+    // Send immediate acknowledgment
+    sendResponse({ success: true, status: 'started' });
+    
+    // Process in background
+    (async () => {
+      await refreshAllTabData();
+    })();
+    
+    // Return true to indicate we'll respond asynchronously
+    return true;
   } else if (message.action === "closeTabs") {
     const { tabIds } = message;
     Promise.all(tabIds.map(tabId => {

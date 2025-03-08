@@ -39,46 +39,88 @@ const faviconObserver = new IntersectionObserver((entries) => {
 
 // Function to initialize the popup
 async function initPopup() {
-  // Prevent double initialization
-  if (isInitialized) return;
-  
-  try {
-    isInitialized = true;
-    
-    // Show loading state
-    document.getElementById('tab-groups-container').innerHTML = '<div class="loading">Loading tabs...</div>';
-    
-    // Set up message listeners first - using a more reliable approach
-    setupMessageListeners();
-    
-    // Try to load from local storage first (fastest)
-    try {
-      const storageData = await chrome.storage.local.get('tabData');
-      if (storageData && storageData.tabData && Object.keys(storageData.tabData).length > 0) {
-        tabData = storageData.tabData;
-        renderTabGroups();
-        
-        // Still try to get fresh data from background, but don't block UI
-        refreshDataFromBackground();
-        return;
-      }
-    } catch (storageError) {
-      console.warn('Error loading from storage:', storageError);
-    }
-    
-    // If storage didn't work, get data from background
-    await refreshDataFromBackground();
-    
-  } catch (error) {
-    console.error("Error initializing popup:", error);
-    document.getElementById('tab-groups-container').innerHTML = 
-      '<div class="error">Error loading tabs. Please try reloading the extension.</div>';
+  if (isInitialized) {
+    console.log('Popup already initialized, skipping');
+    return;
   }
   
-  // Set up event listeners
-  document.getElementById('analyze-btn').addEventListener('click', analyzeTabs);
-  document.getElementById('close-inactive-btn').addEventListener('click', closeInactiveTabs);
-  document.getElementById('search-input').addEventListener('input', handleSearch);
+  console.log('Initializing popup...');
+  isInitialized = true;
+  
+  // Show loading state
+  document.getElementById('tab-groups-container').innerHTML = 
+    '<div class="loading">Loading tabs...</div>';
+  
+  // Set up message listeners first
+  setupMessageListeners();
+  
+  // Try to get all tabs directly first to ensure we have the most up-to-date list
+  let currentTabs = [];
+  try {
+    console.log('Querying for all tabs directly...');
+    currentTabs = await chrome.tabs.query({});
+    console.log(`Found ${currentTabs.length} tabs directly`);
+  } catch (tabError) {
+    console.error('Error querying tabs directly:', tabError);
+  }
+  
+  // Try to load data from storage first for faster display
+  let dataLoaded = false;
+  try {
+    console.log('Attempting to load tab data from storage...');
+    const result = await chrome.storage.local.get('tabData');
+    
+    if (result.tabData && Object.keys(result.tabData).length > 0) {
+      console.log(`Loaded ${Object.keys(result.tabData).length} tabs from storage`);
+      tabData = result.tabData;
+      
+      // Check if the stored data matches current tabs
+      if (currentTabs.length > 0) {
+        const storedTabIds = new Set(Object.keys(tabData).map(id => parseInt(id)));
+        const currentTabIds = new Set(currentTabs.map(tab => tab.id));
+        
+        // Check if we're missing tabs or have extra tabs
+        const missingTabs = currentTabs.filter(tab => !storedTabIds.has(tab.id));
+        const extraTabs = Object.keys(tabData).filter(id => !currentTabIds.has(parseInt(id)));
+        
+        console.log(`Missing ${missingTabs.length} tabs, have ${extraTabs.length} extra tabs`);
+        
+        // If there's a significant mismatch, force a refresh
+        if (missingTabs.length > 0 || extraTabs.length > 3) {
+          console.log('Significant tab mismatch detected, forcing refresh');
+          await analyzeTabs(); // Force a complete refresh
+          dataLoaded = true;
+        } else {
+          // Just render what we have for now
+          renderTabGroups();
+          dataLoaded = true;
+          
+          // Still refresh in the background
+          refreshDataFromBackground();
+        }
+      } else {
+        // Just render what we have from storage
+        renderTabGroups();
+        dataLoaded = true;
+        
+        // Still refresh in the background
+        refreshDataFromBackground();
+      }
+    } else {
+      console.log('No tab data found in storage or empty data');
+    }
+  } catch (storageError) {
+    console.error('Error loading from storage:', storageError);
+  }
+  
+  // If we couldn't load from storage or there was a mismatch, force a refresh
+  if (!dataLoaded) {
+    console.log('No data loaded from storage, forcing complete refresh');
+    await analyzeTabs(); // This will force a complete refresh
+  }
+  
+  // Add event listeners
+  addEventListeners();
 }
 
 // Function to refresh data from background script
@@ -147,19 +189,66 @@ function setupMessageListeners() {
   }
 }
 
-// Message handler function
+// Handle messages from the background script
 function handleBackgroundMessages(message, sender, sendResponse) {
-  try {
-    if (message.action === "tabAnalyzed" || message.action === "tabDataUpdated") {
-      if (message.tabData) {
-        tabData = message.tabData;
-        renderTabGroups();
-      }
+  console.log('Received message from background:', message);
+  
+  if (message.action === "tabDataUpdated") {
+    console.log('Received updated tab data from background');
+    
+    if (message.tabData) {
+      tabData = message.tabData;
+      renderTabGroups();
+      
+      // Save to storage for faster access next time
+      chrome.storage.local.set({ tabData });
+    } else if (message.status === 'complete') {
+      // If we just got a completion notification without data, refresh from storage
+      chrome.storage.local.get('tabData', result => {
+        if (result.tabData) {
+          tabData = result.tabData;
+          renderTabGroups();
+        }
+      });
     }
-  } catch (error) {
-    console.warn('Error handling message:', error);
+  } else if (message.action === "tabAnalysisProgress") {
+    // Update progress indicator
+    const { processed, total } = message;
+    const container = document.getElementById('tab-groups-container');
+    
+    // Only update if we're still in loading state
+    if (container.querySelector('.loading')) {
+      container.innerHTML = 
+        `<div class="loading">Analyzing tabs... ${processed}/${total} (${Math.round(processed/total*100)}%)</div>`;
+    }
+  } else if (message.action === "tabDataError") {
+    console.error('Error from background:', message.error);
+    
+    // Show error but don't clear existing data
+    const container = document.getElementById('tab-groups-container');
+    
+    // Only show error if we don't have data yet
+    if (container.querySelector('.loading')) {
+      container.innerHTML = 
+        `<div class="error">
+          Error loading tabs: ${message.error}<br><br>
+          <button onclick="analyzeTabs()">Retry</button>
+        </div>`;
+    } else {
+      // Just show a notification if we already have data
+      const notification = document.createElement('div');
+      notification.className = 'notification error';
+      notification.textContent = `Background error: ${message.error}`;
+      document.body.appendChild(notification);
+      
+      // Remove after 5 seconds
+      setTimeout(() => {
+        if (notification.parentNode) {
+          notification.parentNode.removeChild(notification);
+        }
+      }, 5000);
+    }
   }
-  return true; // Keep the message channel open
 }
 
 // Helper function to get tab data with a timeout
@@ -600,3 +689,21 @@ function addEventListeners() {
 
 // Initialize popup when DOM is ready
 document.addEventListener('DOMContentLoaded', initPopup);
+
+// Set up periodic refresh to keep data fresh
+let lastRefreshTime = Date.now();
+
+// Check every minute if we need to refresh
+setInterval(() => {
+  const now = Date.now();
+  const minutesSinceLastRefresh = (now - lastRefreshTime) / (1000 * 60);
+  
+  // If it's been more than 5 minutes since last refresh, refresh data
+  if (minutesSinceLastRefresh > 5) {
+    console.log(`It's been ${Math.round(minutesSinceLastRefresh)} minutes since last refresh, refreshing data...`);
+    lastRefreshTime = now;
+    
+    // Send a message to refresh all tabs
+    chrome.runtime.sendMessage({ action: "refreshAllTabs" });
+  }
+}, 60000); // Check every minute
