@@ -313,3 +313,21 @@ button:active {
 ::-webkit-scrollbar-thumb:hover {
   background: var(--primary-color);
 }
+
+.loading,
+.error {
+  padding: 20px;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 14px;
+  background-color: var(--surface);
+  border-radius: 8px;
+  margin: 16px;
+  border: 1px solid var(--border);
+}
+
+.error {
+  color: #ef4444;
+  background-color: #fee2e2;
+  border-color: #fecaca;
+}

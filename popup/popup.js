@@ -1,6 +1,7 @@
 // Store for our tab data
 let tabData = {};
 let categories = new Set();
+let isInitialized = false;
 
 // Create a favicon cache
 const faviconCache = new Map();
@@ -38,35 +39,41 @@ const faviconObserver = new IntersectionObserver((entries) => {
 
 // Function to initialize the popup
 async function initPopup() {
-  // Retrieve tab data from background script
-  chrome.runtime.sendMessage({ action: "getTabData" }, async (response) => {
-    if (response && response.tabData) {
-      tabData = response.tabData;
-      
-      // If no data, analyze tabs now
-      if (Object.keys(tabData).length === 0) {
-        await analyzeTabs();
-      } else {
-        renderTabGroups();
-      }
-    } else {
-      console.error("Failed to get tab data");
-    }
-  });
+  // Prevent double initialization
+  if (isInitialized) return;
   
-  // Listen for tab analyzed messages from background script
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.action === "tabAnalyzed") {
-      // Refresh the data and re-render
-      chrome.runtime.sendMessage({ action: "getTabData" }, (response) => {
-        if (response && response.tabData) {
-          tabData = response.tabData;
-          renderTabGroups();
-        }
-      });
+  try {
+    isInitialized = true;
+    
+    // Show loading state
+    document.getElementById('tab-groups-container').innerHTML = '<div class="loading">Loading tabs...</div>';
+    
+    // Set up message listeners first - using a more reliable approach
+    setupMessageListeners();
+    
+    // Try to load from local storage first (fastest)
+    try {
+      const storageData = await chrome.storage.local.get('tabData');
+      if (storageData && storageData.tabData && Object.keys(storageData.tabData).length > 0) {
+        tabData = storageData.tabData;
+        renderTabGroups();
+        
+        // Still try to get fresh data from background, but don't block UI
+        refreshDataFromBackground();
+        return;
+      }
+    } catch (storageError) {
+      console.warn('Error loading from storage:', storageError);
     }
-    return true; // Keep the message channel open for async responses
-  });
+    
+    // If storage didn't work, get data from background
+    await refreshDataFromBackground();
+    
+  } catch (error) {
+    console.error("Error initializing popup:", error);
+    document.getElementById('tab-groups-container').innerHTML = 
+      '<div class="error">Error loading tabs. Please try reloading the extension.</div>';
+  }
   
   // Set up event listeners
   document.getElementById('analyze-btn').addEventListener('click', analyzeTabs);
@@ -74,41 +81,265 @@ async function initPopup() {
   document.getElementById('search-input').addEventListener('input', handleSearch);
 }
 
+// Function to refresh data from background script
+async function refreshDataFromBackground() {
+  try {
+    console.log('Refreshing data from background...');
+    
+    // Get initial tab data with timeout to prevent hanging
+    const response = await getTabDataWithTimeout(5000);
+    
+    if (response && response.tabData && Object.keys(response.tabData).length > 0) {
+      console.log(`Refreshed data with ${Object.keys(response.tabData).length} tabs`);
+      tabData = response.tabData;
+      renderTabGroups();
+      return true;
+    } else if (response && response.error) {
+      console.error('Error refreshing data:', response.error);
+      // If we have an error but already have tab data, keep using it
+      if (Object.keys(tabData).length > 0) {
+        console.log('Using existing tab data instead');
+        renderTabGroups();
+        return true;
+      }
+    }
+    
+    // If we got here, we need to analyze tabs
+    console.log('No data received, trying to analyze tabs...');
+    await analyzeTabs();
+    return true;
+  } catch (error) {
+    console.error('Error refreshing data:', error);
+    
+    // If we already rendered something, don't show error
+    if (document.querySelector('.tab-group')) {
+      console.log('Already rendered groups, keeping current view');
+      return true;
+    }
+    
+    // If we have tab data but failed to render, try rendering again
+    if (Object.keys(tabData).length > 0) {
+      console.log('Have tab data, trying to render again');
+      try {
+        renderTabGroups();
+        return true;
+      } catch (renderError) {
+        console.error('Error rendering tab groups:', renderError);
+      }
+    }
+    
+    document.getElementById('tab-groups-container').innerHTML = 
+      `<div class="error">Error loading tabs: ${error.message}<br><br>
+      Please try the Analyze button or reload the extension.</div>`;
+    return false;
+  }
+}
+
+// Helper function to set up message listeners
+function setupMessageListeners() {
+  try {
+    // Remove any existing listeners to prevent duplicates
+    chrome.runtime.onMessage.removeListener(handleBackgroundMessages);
+    // Add the listener
+    chrome.runtime.onMessage.addListener(handleBackgroundMessages);
+  } catch (error) {
+    console.warn('Error setting up message listeners:', error);
+  }
+}
+
+// Message handler function
+function handleBackgroundMessages(message, sender, sendResponse) {
+  try {
+    if (message.action === "tabAnalyzed" || message.action === "tabDataUpdated") {
+      if (message.tabData) {
+        tabData = message.tabData;
+        renderTabGroups();
+      }
+    }
+  } catch (error) {
+    console.warn('Error handling message:', error);
+  }
+  return true; // Keep the message channel open
+}
+
+// Helper function to get tab data with a timeout
+async function getTabDataWithTimeout(timeout = 5000) {
+  console.log(`Getting tab data with ${timeout}ms timeout...`);
+  
+  // First try to get from storage directly
+  try {
+    console.log('Trying to get tab data from storage...');
+    const storageData = await chrome.storage.local.get('tabData');
+    if (storageData && storageData.tabData && Object.keys(storageData.tabData).length > 0) {
+      console.log(`Found ${Object.keys(storageData.tabData).length} tabs in storage`);
+      return { tabData: storageData.tabData };
+    }
+    console.log('No tab data in storage or empty data');
+  } catch (storageError) {
+    console.error('Error getting tab data from storage:', storageError);
+  }
+  
+  // Then try to get from background script
+  return new Promise((resolve) => {
+    console.log('Requesting tab data from background script...');
+    
+    // Set a timeout to prevent hanging if background doesn't respond
+    const timeoutId = setTimeout(() => {
+      console.warn(`getTabData timed out after ${timeout}ms`);
+      resolve({ tabData: {}, error: 'Timeout getting tab data' });
+    }, timeout);
+    
+    // Request the data
+    try {
+      chrome.runtime.sendMessage({ action: "getTabData" }, (response) => {
+        clearTimeout(timeoutId);
+        
+        if (chrome.runtime.lastError) {
+          console.error('Runtime error getting tab data:', chrome.runtime.lastError);
+          resolve({ tabData: {}, error: chrome.runtime.lastError.message });
+          return;
+        }
+        
+        if (response && response.tabData) {
+          console.log(`Received ${Object.keys(response.tabData).length} tabs from background`);
+          resolve(response);
+        } else {
+          console.warn('Received empty or invalid response from background');
+          resolve({ tabData: {}, error: 'Invalid response from background' });
+        }
+      });
+    } catch (error) {
+      clearTimeout(timeoutId);
+      console.error('Error sending getTabData message:', error);
+      resolve({ tabData: {}, error: error.message });
+    }
+  });
+}
+
 // Function to analyze all tabs
 async function analyzeTabs() {
   try {
-    // Update button state
+    // Update button state and show loading
     const analyzeBtn = document.getElementById('analyze-btn');
     analyzeBtn.textContent = "Analyzing...";
     analyzeBtn.disabled = true;
+    
+    // Show loading state
+    document.getElementById('tab-groups-container').innerHTML = 
+      '<div class="loading">Analyzing tabs...</div>';
 
-    // Get all tabs
-    const tabs = await chrome.tabs.query({});
+    console.log('Starting forced tab analysis...');
     
-    // Clear existing tab data
+    // Clear existing tab data to force a fresh start
     tabData = {};
-    
-    // Analyze each tab
-    for (const tab of tabs) {
-      // Send message to background script to analyze this tab
-      chrome.runtime.sendMessage({ 
-        action: "analyzeSingleTab", 
-        tabId: tab.id 
-      });
+    try {
+      await chrome.storage.local.remove('tabData');
+      console.log('Cleared existing tab data');
+    } catch (clearError) {
+      console.warn('Error clearing storage:', clearError);
     }
     
-    // Wait for a short time to allow background script to process
-    await new Promise(resolve => setTimeout(resolve, 500));
-    
-    // Get updated tab data
-    chrome.runtime.sendMessage({ action: "getTabData" }, (response) => {
-      if (response && response.tabData) {
-        tabData = response.tabData;
-        renderTabGroups();
+    // First try to get tabs directly to check if we have access
+    let allTabs;
+    try {
+      allTabs = await chrome.tabs.query({});
+      console.log(`Found ${allTabs.length} tabs to analyze`);
+    } catch (tabError) {
+      console.error('Error accessing tabs:', tabError);
+      throw new Error('Cannot access tabs. Extension permissions may need to be refreshed.');
+    }
+
+    // If we found no tabs, throw an error
+    if (!allTabs || allTabs.length === 0) {
+      throw new Error('No tabs found to analyze. Try reloading the extension.');
+    }
+
+    // Request analysis of all tabs with increased timeout
+    console.log('Sending analyzeAllTabs message to background...');
+    const response = await new Promise((resolve) => {
+      const timeoutId = setTimeout(() => {
+        console.warn('analyzeAllTabs timed out after 15 seconds');
+        resolve({ success: false, error: 'Operation timed out' });
+      }, 15000); // Increased timeout to 15 seconds
+      
+      try {
+        chrome.runtime.sendMessage({ action: "analyzeAllTabs" }, (response) => {
+          clearTimeout(timeoutId);
+          console.log('Received analyzeAllTabs response:', response);
+          resolve(response || { success: false, error: 'No response from background' });
+        });
+      } catch (msgError) {
+        clearTimeout(timeoutId);
+        console.error('Error sending analyzeAllTabs message:', msgError);
+        resolve({ success: false, error: msgError.message });
       }
     });
+
+    console.log('Analysis response:', response);
+
+    if (response && response.success) {
+      // Even if successful, force a fresh data load
+      console.log('Forcing fresh data load...');
+      const freshData = await getTabDataWithTimeout(10000); // Increased timeout
+      
+      if (freshData && freshData.tabData && Object.keys(freshData.tabData).length > 0) {
+        tabData = freshData.tabData;
+        renderTabGroups();
+        console.log('Successfully refreshed tab data');
+      } else {
+        // If we can't get fresh data but have tabs, create basic data
+        console.log('Creating basic tab data from query...');
+        tabData = {};
+        for (const tab of allTabs) {
+          tabData[tab.id] = {
+            id: tab.id,
+            url: tab.url,
+            title: tab.title,
+            category: "Uncategorized", // Will be updated by background
+            summary: tab.title || "No summary available",
+            lastAccessed: new Date().getTime()
+          };
+        }
+        renderTabGroups();
+        
+        // Trigger background refresh
+        chrome.runtime.sendMessage({ action: "refreshAllTabs" });
+      }
+    } else {
+      // If analysis failed, try to at least show basic tab data
+      console.log('Analysis failed, showing basic tab data...');
+      tabData = {};
+      for (const tab of allTabs) {
+        tabData[tab.id] = {
+          id: tab.id,
+          url: tab.url,
+          title: tab.title,
+          category: "Uncategorized",
+          summary: tab.title || "No summary available",
+          lastAccessed: new Date().getTime()
+        };
+      }
+      renderTabGroups();
+      
+      // Show warning but don't throw error
+      const container = document.getElementById('tab-groups-container');
+      const warning = document.createElement('div');
+      warning.className = 'warning';
+      warning.textContent = 'Some tab information may be incomplete. Analysis is continuing in the background.';
+      container.insertBefore(warning, container.firstChild);
+      
+      // Trigger background refresh
+      chrome.runtime.sendMessage({ action: "refreshAllTabs" });
+    }
   } catch (error) {
     console.error('Error analyzing tabs:', error);
+    document.getElementById('tab-groups-container').innerHTML = 
+      `<div class="error">
+        Error analyzing tabs: ${error.message}<br><br>
+        Please try reloading the extension from chrome://extensions page.
+        <br><br>
+        <button onclick="window.location.reload()">Reload Popup</button>
+      </div>`;
   } finally {
     // Reset button state
     const analyzeBtn = document.getElementById('analyze-btn');

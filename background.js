@@ -4,6 +4,134 @@
 // Store for our tab data
 let tabData = {};
 
+// Load saved tab data
+async function loadSavedData() {
+  try {
+    console.log('Loading saved tab data...');
+    const result = await chrome.storage.local.get('tabData');
+    
+    // Initialize tabData as empty object if nothing in storage
+    tabData = result.tabData || {};
+    
+    // Get all current tabs
+    const existingTabs = await chrome.tabs.query({});
+    console.log(`Found ${existingTabs.length} current tabs`);
+    
+    // Create a map of existing tab IDs for faster lookup
+    const existingTabIds = new Set(existingTabs.map(tab => tab.id));
+    
+    // Remove stale tabs from tabData
+    let staleTabsRemoved = 0;
+    for (const tabId in tabData) {
+      if (!existingTabIds.has(parseInt(tabId))) {
+        delete tabData[tabId];
+        staleTabsRemoved++;
+      }
+    }
+    
+    // Add any missing tabs to tabData
+    let newTabsAdded = 0;
+    for (const tab of existingTabs) {
+      if (!tabData[tab.id]) {
+        // Initialize basic data for the tab
+        tabData[tab.id] = {
+          id: tab.id,
+          url: tab.url,
+          title: tab.title,
+          category: await getCategory(tab.url),
+          summary: tab.title || "No summary available",
+          lastAccessed: new Date().getTime(),
+          content: { title: tab.title, metaDescription: "", bodyText: "" }
+        };
+        newTabsAdded++;
+      }
+    }
+    
+    console.log(`Removed ${staleTabsRemoved} stale tabs, added ${newTabsAdded} new tabs`);
+    
+    // Save cleaned data back to storage
+    await chrome.storage.local.set({ tabData });
+    
+    // If we had to add new tabs, analyze them in the background
+    if (newTabsAdded > 0) {
+      refreshAllTabData();
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('Error loading saved data:', error);
+    tabData = {};
+    return false;
+  }
+}
+
+// Function to refresh all tab data
+async function refreshAllTabData() {
+  try {
+    console.log('Refreshing all tab data...');
+    const tabs = await chrome.tabs.query({});
+    
+    // Process tabs in batches
+    const BATCH_SIZE = 5;
+    for (let i = 0; i < tabs.length; i += BATCH_SIZE) {
+      const batch = tabs.slice(i, i + BATCH_SIZE);
+      await Promise.all(batch.map(tab => analyzeTab(tab)));
+      
+      // Small delay between batches
+      if (i + BATCH_SIZE < tabs.length) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    }
+    
+    // Save the final data
+    await chrome.storage.local.set({ tabData });
+    
+    // Notify popup if open
+    sendMessageToPopupIfOpen({
+      action: "tabDataUpdated",
+      tabData: tabData,
+      status: 'complete'
+    });
+    
+    return true;
+  } catch (error) {
+    console.error('Error refreshing all tab data:', error);
+    return false;
+  }
+}
+
+// Initialize the extension
+async function initializeExtension() {
+  try {
+    console.log('Initializing extension...');
+    
+    // Add a small delay to ensure extension is fully loaded
+    await new Promise(resolve => setTimeout(resolve, 500));
+    
+    // Check if extension context is still valid
+    if (!chrome.tabs || !chrome.tabs.query) {
+      console.log('Extension context invalidated during initialization');
+      return;
+    }
+    
+    // Load saved data first
+    const loadResult = await loadSavedData();
+    if (!loadResult) {
+      console.log('Failed to load saved data, will try to refresh all tabs');
+      await refreshAllTabData();
+    }
+    
+    // Set up periodic refresh of tab data (every 5 minutes)
+    setInterval(async () => {
+      console.log('Running periodic tab data refresh...');
+      await loadSavedData();
+    }, 5 * 60 * 1000);
+    
+  } catch (error) {
+    console.error('Error initializing extension:', error);
+  }
+}
+
 // Function to fetch page content from a tab
 async function getPageContent(tabId) {
   try {
@@ -372,117 +500,229 @@ async function getCategory(url) {
   return "Uncategorized";
 }
 
-
-
 // Function to analyze and categorize a tab
 async function analyzeTab(tab) {
-  const { id, url, title } = tab;
-  
-  // Skip special browser pages, settings, etc.
-  if (!url || url.startsWith('chrome:') || url.startsWith('chrome-extension:') || url.startsWith('about:')) {
-    return;
-  }
-  
-  // Get page content
-  const content = await getPageContent(id);
-  
-  // In a real implementation, here you would:
-  // 1. Call an LLM API to categorize/summarize the tab content
-  // For the prototype, we'll use a simple categorization based on URL/title
-  
-  let category = await getCategory(url);
-  
-  // Generate a basic summary (replace with LLM in production)
-  const summary = content.title ? content.title : "No summary available";
-  
-  // Store the tab data
-  tabData[id] = {
-    id,
-    url,
-    title,
-    category,
-    summary,
-    lastAccessed: new Date().getTime(),
-    content: content
-  };
-  
-  // Save to storage for persistence
-  chrome.storage.local.set({ tabData });
-  
-  // Try to send a message to the popup, but handle the error if popup isn't open
   try {
-    // Attempt to notify popup if it's open
-    chrome.runtime.sendMessage({ action: "tabAnalyzed", tabId: id })
-      .catch(error => {
-        // Suppress the error about receiving end not existing
-        console.log("Popup not available for message, this is normal");
-      });
+    const { id, url, title } = tab;
+    
+    // Skip special browser pages, settings, etc.
+    if (!url || url.startsWith('chrome:') || url.startsWith('chrome-extension:') || url.startsWith('about:')) {
+      return;
+    }
+    
+    // Get page content
+    const content = await getPageContent(id);
+    
+    let category = await getCategory(url);
+    
+    // Generate a basic summary (replace with LLM in production)
+    const summary = content.title ? content.title : "No summary available";
+    
+    // Store the tab data
+    tabData[id] = {
+      id,
+      url,
+      title,
+      category,
+      summary,
+      lastAccessed: new Date().getTime(),
+      content: content
+    };
+    
+    // Save to storage for persistence
+    await chrome.storage.local.set({ tabData });
+    
+    // Notify popup if it's open - use a safer approach
+    sendMessageToPopupIfOpen({
+      action: "tabAnalyzed", 
+      tabId: id,
+      tabData: tabData
+    });
   } catch (error) {
-    // Suppress any errors related to messaging
-    console.log("Error sending message to popup, this is normal if popup is closed");
+    console.error('Error analyzing tab:', error);
   }
 }
 
-// Listen for tab events
+// Helper function to safely send messages to popup
+function sendMessageToPopupIfOpen(message) {
+  // First check if we're in a valid state to send messages
+  if (!chrome.runtime || !chrome.runtime.sendMessage) {
+    return; // Extension context invalidated or reloading
+  }
+  
+  // Check if popup is open before trying to send a message
+  chrome.runtime.getContexts ? 
+    // Use getContexts API if available (Chrome 93+)
+    chrome.runtime.getContexts({
+      contextTypes: ['POPUP']
+    }, (contexts) => {
+      if (contexts && contexts.length > 0) {
+        // Popup is open, try to send message
+        try {
+          chrome.runtime.sendMessage(message).catch(() => {
+            // Silently ignore expected errors
+          });
+        } catch (e) {
+          // Silently ignore
+        }
+      }
+    }) : 
+    // Fallback for older Chrome versions - just try sending with error handling
+    safeRuntimeSendMessage(message);
+}
+
+// Separate function for the actual sending with error handling
+function safeRuntimeSendMessage(message) {
+  try {
+    // Use a non-awaited promise with catch to prevent unhandled rejections
+    const sendPromise = chrome.runtime.sendMessage(message);
+    if (sendPromise && sendPromise.catch) {
+      sendPromise.catch(() => {
+        // Silently ignore expected errors
+      });
+    }
+  } catch (error) {
+    // Silently ignore all errors
+  }
+}
+
+// Update tab events to be more robust
 chrome.tabs.onCreated.addListener(async (tab) => {
-  await analyzeTab(tab);
+  try {
+    await analyzeTab(tab);
+    await loadSavedData(); // Refresh all tab data to ensure consistency
+  } catch (error) {
+    console.error('Error handling tab creation:', error);
+  }
 });
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (changeInfo.status === 'complete') {
-    await analyzeTab(tab);
+  try {
+    if (changeInfo.status === 'complete') {
+      await analyzeTab(tab);
+      // Only refresh all data if this tab's URL changed
+      if (changeInfo.url) {
+        await loadSavedData();
+      }
+    }
+  } catch (error) {
+    console.error('Error handling tab update:', error);
   }
 });
 
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
-  const { tabId } = activeInfo;
-  
+  try {
+    const { tabId } = activeInfo;
+    
+    if (tabData[tabId]) {
+      tabData[tabId].lastAccessed = new Date().getTime();
+      await chrome.storage.local.set({ tabData });
+    }
+    
+    const tab = await chrome.tabs.get(tabId);
+    await analyzeTab(tab);
+    await loadSavedData(); // Refresh all tab data when switching tabs
+  } catch (error) {
+    console.error('Error handling tab activation:', error);
+  }
+});
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
   if (tabData[tabId]) {
-    tabData[tabId].lastAccessed = new Date().getTime();
-    chrome.storage.local.set({ tabData });
-  }
-  
-  const tab = await chrome.tabs.get(tabId);
-  await analyzeTab(tab);
-});
-
-// On extension startup, analyze all existing tabs
-chrome.runtime.onStartup.addListener(async () => {
-  const tabs = await chrome.tabs.query({});
-  for (const tab of tabs) {
-    await analyzeTab(tab);
+    delete tabData[tabId];
+    await chrome.storage.local.set({ tabData });
   }
 });
 
-// Initialize on install
-chrome.runtime.onInstalled.addListener(async () => {
-  const tabs = await chrome.tabs.query({});
-  for (const tab of tabs) {
-    await analyzeTab(tab);
-  }
-});
+// Initialize on install and startup
+chrome.runtime.onInstalled.addListener(initializeExtension);
+chrome.runtime.onStartup.addListener(initializeExtension);
 
 // Listen for messages from popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "getTabData") {
+    // Immediately return current data
     sendResponse({ tabData });
+    
+    // Then refresh data and notify if it changes
+    loadSavedData().then(() => {
+      sendMessageToPopupIfOpen({
+        action: "tabDataUpdated", 
+        tabData: tabData 
+      });
+    });
   } else if (message.action === "analyzeSingleTab") {
-    // Analyze a single tab
     const tabId = message.tabId;
-    analyzeTab(chrome.tabs.get(tabId));
-    sendResponse({ success: true });
+    chrome.tabs.get(tabId).then(tab => {
+      analyzeTab(tab);
+      sendResponse({ success: true });
+    }).catch(error => {
+      console.error('Error analyzing single tab:', error);
+      sendResponse({ success: false, error: error.message });
+    });
+  } else if (message.action === "analyzeAllTabs") {
+    console.log('Received analyzeAllTabs request');
+    
+    // Send an immediate acknowledgment to prevent timeout
+    sendResponse({ success: true, status: 'started' });
+    
+    // Then do the actual work
+    chrome.tabs.query({}).then(async tabs => {
+      console.log(`Found ${tabs.length} tabs to analyze`);
+      
+      try {
+        // Process tabs in batches to avoid overwhelming the browser
+        const BATCH_SIZE = 5;
+        for (let i = 0; i < tabs.length; i += BATCH_SIZE) {
+          const batch = tabs.slice(i, i + BATCH_SIZE);
+          console.log(`Processing batch ${i/BATCH_SIZE + 1} of ${Math.ceil(tabs.length/BATCH_SIZE)}`);
+          
+          await Promise.all(batch.map(tab => analyzeTab(tab)));
+          
+          // Small delay between batches
+          if (i + BATCH_SIZE < tabs.length) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+        }
+        
+        // Save the final data
+        await chrome.storage.local.set({ tabData });
+        console.log('Tab analysis complete, sending update');
+        
+        // Notify popup of completion
+        sendMessageToPopupIfOpen({
+          action: "tabDataUpdated",
+          tabData: tabData,
+          status: 'complete'
+        });
+      } catch (error) {
+        console.error('Error during batch processing:', error);
+        sendMessageToPopupIfOpen({
+          action: "tabDataUpdated",
+          error: error.message,
+          status: 'error'
+        });
+      }
+    }).catch(error => {
+      console.error('Error querying tabs:', error);
+      sendMessageToPopupIfOpen({
+        action: "tabDataUpdated",
+        error: error.message,
+        status: 'error'
+      });
+    });
   } else if (message.action === "closeTabs") {
     const { tabIds } = message;
-    for (const tabId of tabIds) {
+    Promise.all(tabIds.map(tabId => {
       chrome.tabs.remove(tabId);
       delete tabData[tabId];
-    }
-    chrome.storage.local.set({ tabData });
-    sendResponse({ success: true });
-  } else if (message.action === "groupTabs") {
-    // In Manifest V3, we need to implement tab grouping differently
-    // This is a placeholder for tab grouping functionality
-    sendResponse({ success: true });
+    })).then(() => {
+      chrome.storage.local.set({ tabData });
+      sendResponse({ success: true });
+    }).catch(error => {
+      console.error('Error closing tabs:', error);
+      sendResponse({ success: false, error: error.message });
+    });
   }
   
   return true; // Required for async response
